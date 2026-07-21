@@ -5,9 +5,10 @@
 
 ## 프로젝트 개요
 
-- **v1 (캡스톤 디자인)**: SAP ERP 저널엔트리(약 33만 건)를 대상으로 Autoencoder 기반
-  비지도학습 이상탐지 모델을 구축. 상위 1%(v99) 임계값 기준 851건의 전표(3,322개 라인)를
-  이상 의심 거래로 탐지하고, 룰 기반 로직으로 1차 설명·리스크 스코어링을 수행.
+- **v1 (캡스톤 디자인)**: 공개된 SAP ERP 데이터(BKPF, BSEG, LFA1, SKA1)를 결합해 구성한
+  저널엔트리 데이터(약 33만 건)를 대상으로 Autoencoder 기반 비지도학습 이상탐지 모델을 구축.
+  상위 1%(v99) 임계값 기준 851건의 전표(3,322개 라인)를 이상 의심 거래로 탐지하고,
+  룰 기반 로직으로 1차 설명·리스크 스코어링을 수행.
 - **v2 (RAG 확장)**: v1의 룰 기반 탐지 결과 위에, 생성형 AI API(GPT)와 RAG를 결합한
   설명 계층을 추가. 감사기준서(240·315·330·1100) 원문에서 관련 조항을 검색해 근거로 제시하고,
   감사인이 바로 읽을 수 있는 자연어 설명·후속 절차를 생성.
@@ -18,15 +19,25 @@ v1과 v2는 별개 산출물이며, v1의 탐지 결과(CSV)는 그대로 유지
 ## 아키텍처
 
 ```
-[SAP ERP 데이터 33만 건]
-        │  (v1) 21개 피처 엔지니어링
-        ▼
-[Autoencoder 비지도학습 이상탐지]
-        │  v99 임계값(상위 1%)
-        ▼
-[851건 이상 전표 + 룰 기반 1차 설명/리스크 스코어]  ← ae_detected_doc_summary_v99.csv
+[공개 SAP 데이터: bkpf.csv, bseg.csv, lfa1.csv, ska1.csv]
         │
-        │  (v2) 탐지 유형 분류 → 감사 실무 용어로 변환
+        │  (v1-1) main.py            : BKPF + BSEG 조인 → merged_cleaned.csv
+        ▼
+        │  (v1-2) feature_engineering.py
+        │         : 시간/금액/관계 기반 피처 생성 → featured.csv
+        ▼
+        │  (v1-3) lfa1_ska1_join.py
+        │         : + LFA1(거래처마스터), SKA1(계정마스터) 조인 → featured_v2.csv
+        ▼
+        │  (v1-4) autoencoder_final.py
+        │         : Autoencoder 학습(비지도) → 재구성오차 계산
+        │         : → ae_scored.csv(전체), ae_detected.csv(95%ile 탐지)
+        ▼
+        │  (v1-5) audit_report_v99_improved.py
+        │         : v99(상위 1%) 임계값 재계산 → 룰 기반 1차 설명·리스크 스코어링
+        │         : → ae_detected_doc_summary_v99.csv (851건, 문서 단위)
+        ▼
+        │  (v2-1) 탐지 유형 분류 → 감사 실무 용어로 변환
         ▼
 [TF-IDF 검색: 감사기준서 240/315/330/1100 원문 (294개 문단)]
         │  관련 조항 top-3 검색 (또는 fallback 시 검색 생략)
@@ -36,6 +47,9 @@ v1과 v2는 별개 산출물이며, v1의 탐지 결과(CSV)는 그대로 유지
         ▼
 [audit_explanations_v99.json]
 ```
+
+(참고: `inject_anomalies.py`는 featured_v2.csv에 합성 이상치를 주입해 모델 민감도를
+검증하는 보조 스크립트로, 메인 파이프라인과 별도로 사용되었습니다.)
 
 ## 설계 배경 (왜 이렇게 만들었나)
 
@@ -69,20 +83,33 @@ v1과 v2는 별개 산출물이며, v1의 탐지 결과(CSV)는 그대로 유지
 pip install -r requirements.txt
 cp .env.example .env  # 발급받은 OPENAI_API_KEY 입력
 
-# 1) 감사기준서 원문 PDF에서 관련 조항 추출 (최초 1회)
-python src/extract_audit_standards.py
+# v1: 데이터 파이프라인 (원본 SAP 공개데이터 필요)
+python src/main.py
+python src/feature_engineering.py
+python src/lfa1_ska1_join.py
+python src/autoencoder_final.py
+python src/audit_report_v99_improved.py
 
-# 2) RAG 기반 감사 설명 생성
-python src/rag_audit_explainer.py
+# v2: RAG 기반 감사 설명 생성
+python src/extract_audit_standards.py   # 감사기준서 PDF → 근거 코퍼스 생성 (최초 1회)
+python src/rag_audit_explainer.py       # TF-IDF 검색 + GPT API 호출
 ```
 
 ## 폴더 구조
 
 ```
 ├── src/
-│   ├── extract_audit_standards.py   # 기준서 PDF → 근거 코퍼스 생성
-│   └── rag_audit_explainer.py       # TF-IDF 검색 + GPT API 호출 파이프라인
+│   ├── main.py                       # BKPF+BSEG 조인
+│   ├── feature_engineering.py        # 시간/금액/관계 기반 피처 생성
+│   ├── lfa1_ska1_join.py             # + LFA1(거래처마스터), SKA1(계정마스터) 조인
+│   ├── autoencoder_final.py          # Autoencoder 학습 및 이상탐지
+│   ├── audit_report_v99_improved.py  # v99 임계값 재계산, 룰 기반 설명·리스크 스코어링
+│   ├── inject_anomalies.py           # (보조) 합성 이상치 주입 - 민감도 검증용
+│   ├── extract_audit_standards.py    # 기준서 PDF → 근거 코퍼스 생성
+│   └── rag_audit_explainer.py        # TF-IDF 검색 + GPT API 호출 파이프라인
 ├── standards_corpus/                 # 감사기준서 240/315/330/1100 발췌 (294개 문단)
+│                                      # ※ 저작권 문제로 저장소에는 포함하지 않음 —
+│                                      #   extract_audit_standards.py 실행 시 로컬에 생성됨
 ├── data/
 │   └── ae_detected_doc_summary_v99.csv  # v1 탐지 결과 (문서 단위, 851건)
 ├── outputs/
@@ -93,8 +120,13 @@ python src/rag_audit_explainer.py
 
 ## 기술 스택
 
-Python, pandas, scikit-learn(TF-IDF), OpenAI API(GPT-4o-mini), pypdf
+Python, pandas, scikit-learn, TensorFlow/Keras(Autoencoder), OpenAI API(GPT-4o-mini), pypdf
 
 ## 참고 자료
 
+- SAP Dataset | BigQuery Dataset (Kaggle, mustafakeser4 — cloud-training-demos.SAP_REPLICATED_DATA)
 - 회계감사기준 전문(全文), 한국공인회계사회(KICPA), 2025년 11월 개정
+
+본 저장소는 감사기준서 원문 코퍼스를 포함하지 않습니다. `src/extract_audit_standards.py`를
+실행하려면 한국공인회계사회(KICPA) 또는 회계기준원(KASB, db.kasb.or.kr)에서 개별적으로
+원문을 확보한 후 로컬에 배치해야 합니다.
